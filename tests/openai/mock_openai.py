@@ -14,6 +14,7 @@ LIST_CONTENT = "LIST_CONTENT"
 AZURE_ANNOTATIONS = "AZURE_ANNOTATIONS"
 EMPTY_STREAM = "EMPTY_STREAM"
 ERROR_MID_STREAM = "ERROR_MID_STREAM"
+INCOMPLETE_STREAM = "INCOMPLETE_STREAM"
 
 app = fastapi.FastAPI()
 
@@ -390,6 +391,19 @@ _DUMMY_RESPONSES_STREAM_EVENTS = [
 ]
 
 
+_DUMMY_RESPONSES_INCOMPLETE_STREAM_EVENTS = [
+    *_DUMMY_RESPONSES_STREAM_EVENTS[:-1],
+    {
+        "response": {
+            **_make_responses_payload(outputs=_DUMMY_TEXT_OUTPUTS),
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+        },
+        "type": "response.incomplete",
+    },
+]
+
+
 class ResponsesPayload(BaseModel):
     input: Any
     tools: list[Any] | None = None
@@ -399,9 +413,12 @@ class ResponsesPayload(BaseModel):
 @app.post("/responses", response_model_exclude_unset=True)
 async def responses(payload: ResponsesPayload):
     if payload.stream:
-        content = (
-            f"event: {d['type']}\ndata: {json.dumps(d)}\n\n" for d in _DUMMY_RESPONSES_STREAM_EVENTS
+        events = (
+            _DUMMY_RESPONSES_INCOMPLETE_STREAM_EVENTS
+            if payload.input == INCOMPLETE_STREAM
+            else _DUMMY_RESPONSES_STREAM_EVENTS
         )
+        content = (f"event: {d['type']}\ndata: {json.dumps(d)}\n\n" for d in events)
         return StreamingResponse(content, media_type="text/event-stream")
 
     if tools := payload.tools or []:

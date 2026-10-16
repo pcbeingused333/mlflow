@@ -9,6 +9,7 @@ import mlflow
 from mlflow.entities.span import SpanType
 from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
 
+from tests.openai.mock_openai import INCOMPLETE_STREAM
 from tests.tracing.helper import get_traces
 
 if Version(openai.__version__) < Version("1.66.00"):
@@ -379,6 +380,33 @@ async def test_responses_stream_close(client, use_context_manager, num_chunks):
         assert span.outputs["id"] == "responses-123"
     else:
         assert span.outputs["output"] == []
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_autolog_incomplete(client):
+    mlflow.openai.autolog()
+
+    response = client.responses.create(input=INCOMPLETE_STREAM, model="gpt-4o", stream=True)
+
+    if client._is_async:
+        async for _ in await response:
+            pass
+    else:
+        for _ in response:
+            pass
+
+    traces = get_traces()
+    assert len(traces) == 1
+    span = traces[0].data.spans[0]
+    assert span.outputs["id"] == "responses-123"
+    assert span.outputs["status"] == "incomplete"
+    assert span.outputs["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert traces[0].info.token_usage == {
+        TokenUsageKey.INPUT_TOKENS: 36,
+        TokenUsageKey.OUTPUT_TOKENS: 87,
+        TokenUsageKey.TOTAL_TOKENS: 123,
+        TokenUsageKey.CACHE_READ_INPUT_TOKENS: 0,
+    }
 
 
 @pytest.mark.asyncio
