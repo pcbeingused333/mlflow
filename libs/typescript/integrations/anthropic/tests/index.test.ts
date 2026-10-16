@@ -66,13 +66,16 @@ describe('tracedAnthropic', () => {
     const trace = await getLastActiveTrace();
     expect(trace.info.state).toBe('OK');
 
+    // Anthropic's input_tokens excludes cache reads and writes; the recorded input
+    // count includes them, as for OpenAI/Gemini and the Python SDK.
     const tokenUsage = trace.info.tokenUsage;
-    expect(tokenUsage).toBeDefined();
-    expect(typeof tokenUsage?.input_tokens).toBe('number');
-    expect(typeof tokenUsage?.output_tokens).toBe('number');
-    expect(typeof tokenUsage?.total_tokens).toBe('number');
-    expect(tokenUsage?.cache_read_input_tokens).toBe(64);
-    expect(tokenUsage?.cache_creation_input_tokens).toBe(32);
+    expect(tokenUsage).toEqual({
+      input_tokens: 128 + 64 + 32,
+      output_tokens: 256,
+      total_tokens: 128 + 64 + 32 + 256,
+      cache_read_input_tokens: 64,
+      cache_creation_input_tokens: 32,
+    });
 
     const span = trace.data.spans[0];
     expect(span.name).toBe('Messages');
