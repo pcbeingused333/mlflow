@@ -148,6 +148,9 @@ def _is_supported_llm_provider(schema: str) -> bool:
 
 
 _MODELS_WITHOUT_OUTPUT_CONFIG: set[tuple[str, str]] = set()
+# Claude Opus 4.7+ and the Claude 5 models reject non-default sampling parameters with a 400.
+_MODELS_WITHOUT_SAMPLING_PARAMS: set[tuple[str, str]] = set()
+_SAMPLING_PARAMS = ("temperature", "top_p", "top_k")
 
 
 def _is_unsupported_output_format_error(exc: MlflowException) -> bool:
@@ -182,6 +185,36 @@ def _is_unsupported_output_format_error(exc: MlflowException) -> bool:
                     }
                 }:
                     return "does not support output format" in msg.lower()
+    return False
+
+
+def _is_unsupported_sampling_param_error(exc: MlflowException, payload: dict[str, Any]) -> bool:
+    """
+    Check whether an Anthropic 400 rejects a sampling parameter sent in ``payload``.
+
+    Claude Opus 4.7 and later, and the Claude 5 models, return an ``invalid_request_error``
+    for non-default ``temperature``, ``top_p`` or ``top_k`` values. The message names the
+    parameter, so it is matched by name rather than by exact wording.
+    """
+    sent = [param for param in _SAMPLING_PARAMS if param in payload]
+    if not sent:
+        return False
+    match exc.__cause__:
+        case requests.exceptions.HTTPError(
+            response=requests.Response(status_code=400) as response,
+        ):
+            try:
+                body = response.json()
+            except Exception:
+                return False
+            match body:
+                case {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": str(msg),
+                    }
+                }:
+                    return any(param in msg.lower() for param in sent)
     return False
 
 
@@ -269,25 +302,36 @@ def _call_llm_provider_api(
         if (provider_name, model) in _MODELS_WITHOUT_OUTPUT_CONFIG:
             chat_payload.pop("output_config", None)
             chat_payload.pop("response_format", None)
+        if (provider_name, model) in _MODELS_WITHOUT_SAMPLING_PARAMS:
+            for param in _SAMPLING_PARAMS:
+                chat_payload.pop(param, None)
 
-        try:
-            response = _send_request(
-                endpoint=proxy_url or provider.get_endpoint_url("llm/v1/chat"),
-                headers=provider.headers | extra_headers,
-                payload=chat_payload,
-            )
-        except MlflowException as e:
-            if provider_name != "anthropic" or not _is_unsupported_output_format_error(e):
-                raise
-            # Model doesn't support structured output; remember and retry.
-            _MODELS_WITHOUT_OUTPUT_CONFIG.add((provider_name, model))
-            chat_payload.pop("output_config", None)
-            chat_payload.pop("response_format", None)
-            response = _send_request(
-                endpoint=proxy_url or provider.get_endpoint_url("llm/v1/chat"),
-                headers=provider.headers | extra_headers,
-                payload=chat_payload,
-            )
+        # One retry per kind of unsupported parameter: structured output, sampling params.
+        for _ in range(3):
+            try:
+                response = _send_request(
+                    endpoint=proxy_url or provider.get_endpoint_url("llm/v1/chat"),
+                    headers=provider.headers | extra_headers,
+                    payload=chat_payload,
+                )
+                break
+            except MlflowException as e:
+                if provider_name != "anthropic":
+                    raise
+                if _is_unsupported_output_format_error(e) and (
+                    "output_config" in chat_payload or "response_format" in chat_payload
+                ):
+                    # Model doesn't support structured output; remember and retry.
+                    _MODELS_WITHOUT_OUTPUT_CONFIG.add((provider_name, model))
+                    chat_payload.pop("output_config", None)
+                    chat_payload.pop("response_format", None)
+                elif _is_unsupported_sampling_param_error(e, chat_payload):
+                    # Model only accepts default sampling params; remember and retry.
+                    _MODELS_WITHOUT_SAMPLING_PARAMS.add((provider_name, model))
+                    for param in _SAMPLING_PARAMS:
+                        chat_payload.pop(param, None)
+                else:
+                    raise
     chat_response = provider.adapter_class.model_to_chat(response, provider.config)
     if len(chat_response.choices) == 0:
         raise MlflowException(

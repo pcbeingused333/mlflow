@@ -1,8 +1,10 @@
+import json
 import re
 from unittest.mock import Mock, patch
 
 import pandas as pd
 import pytest
+import requests
 
 import mlflow
 from mlflow.exceptions import MlflowException
@@ -15,6 +17,7 @@ from mlflow.genai.simulators import (
 )
 from mlflow.genai.simulators.prompts import DEFAULT_PERSONA
 from mlflow.genai.simulators.simulator import _MAX_METADATA_LENGTH
+from mlflow.metrics.genai.model_utils import _MODELS_WITHOUT_SAMPLING_PARAMS
 from mlflow.tracing.constant import TraceMetadataKey
 
 
@@ -1017,3 +1020,47 @@ def test_conversation_simulator_with_simulation_guidelines(mock_predict_fn):
             == "Ask clarifying questions before proceeding"
         )
         assert TraceMetadataKey.TRACE_SESSION in metadata
+
+
+def test_goal_check_detects_goal_on_anthropic_model_rejecting_temperature(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    model_name = "claude-opus-5-5"
+    _MODELS_WITHOUT_SAMPLING_PARAMS.discard(("anthropic", model_name))
+
+    rejected = requests.Response()
+    rejected.status_code = 400
+    rejected._content = json.dumps({
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "temperature: only the default value is supported for this model",
+        },
+    }).encode()
+    accepted = Mock()
+    accepted.raise_for_status.return_value = None
+    accepted.json.return_value = {
+        "content": [{"type": "text", "text": '{"rationale": "done", "result": "yes"}'}],
+        "id": "msg_test",
+        "model": model_name,
+        "role": "assistant",
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "type": "message",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+    simulator = ConversationSimulator.__new__(ConversationSimulator)
+    simulator.user_model = f"anthropic:/{model_name}"
+
+    def fake_post(url, headers, json, timeout):
+        # Like the API: any request that still carries temperature is rejected.
+        return rejected if "temperature" in json else accepted
+
+    with patch("requests.post", side_effect=fake_post):
+        achieved = simulator._check_goal_achieved(
+            conversation_history=[{"role": "user", "content": "Book a table for two"}],
+            last_response="Done, your table for two is booked for 8pm.",
+            goal="Book a table",
+        )
+
+    assert achieved is True

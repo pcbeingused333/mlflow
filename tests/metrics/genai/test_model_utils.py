@@ -11,6 +11,7 @@ from mlflow.genai.utils.gateway_utils import GatewayConfig
 from mlflow.metrics.genai import model_utils
 from mlflow.metrics.genai.model_utils import (
     _MODELS_WITHOUT_OUTPUT_CONFIG,
+    _MODELS_WITHOUT_SAMPLING_PARAMS,
     _parse_model_uri,
     _send_request,
     call_deployments_api,
@@ -839,3 +840,93 @@ def test_send_request_uses_timeout_from_env_var(monkeypatch):
 
         _, kwargs = mock_post.call_args
         assert kwargs["timeout"] == 2
+
+
+def _anthropic_400(message):
+    response = requests.Response()
+    response.status_code = 400
+    response._content = json.dumps({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": message},
+    }).encode()
+    return response
+
+
+def _anthropic_ok(model_name, text="result text"):
+    response = mock.MagicMock()
+    response.status_code = 200
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "content": [{"text": text, "type": "text"}],
+        "id": "msg_test",
+        "model": model_name,
+        "role": "assistant",
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "type": "message",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+    return response
+
+
+def test_score_model_retries_without_sampling_params_on_unsupported(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    model_name = "claude-opus-5-5"
+    _MODELS_WITHOUT_SAMPLING_PARAMS.discard(("anthropic", model_name))
+
+    # Copy each payload as sent; the retry strips params from the same dict in place.
+    sent = []
+    original_send = model_utils._send_request
+
+    def capture_send(endpoint, headers, payload):
+        sent.append(copy.deepcopy(payload))
+        return original_send(endpoint=endpoint, headers=headers, payload=payload)
+
+    with (
+        mock.patch(
+            "requests.post",
+            side_effect=[
+                _anthropic_400("temperature: only the default value is supported for this model"),
+                _anthropic_ok(model_name),
+                _anthropic_ok(model_name),
+            ],
+        ),
+        mock.patch("mlflow.metrics.genai.model_utils._send_request", side_effect=capture_send),
+    ):
+        first = score_model_on_payload(
+            model_uri=f"anthropic:/{model_name}",
+            payload="test prompt",
+            eval_parameters={"temperature": 0.0, "max_tokens": 100},
+        )
+        second = score_model_on_payload(
+            model_uri=f"anthropic:/{model_name}",
+            payload="test prompt",
+            eval_parameters={"temperature": 0.0, "max_tokens": 100},
+        )
+
+    assert first == second == "result text"
+    assert len(sent) == 3
+    assert "temperature" in sent[0]
+    # The retry and later calls for the same model leave the sampling params out.
+    assert "temperature" not in sent[1]
+    assert "temperature" not in sent[2]
+    assert sent[1]["max_tokens"] == 100
+
+
+def test_score_model_does_not_retry_unrelated_bad_request(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    model_name = "claude-opus-5-5-unrelated"
+    _MODELS_WITHOUT_SAMPLING_PARAMS.discard(("anthropic", model_name))
+
+    with mock.patch(
+        "requests.post", side_effect=[_anthropic_400("messages: roles must alternate")]
+    ) as post:
+        with pytest.raises(MlflowException, match="roles must alternate"):
+            score_model_on_payload(
+                model_uri=f"anthropic:/{model_name}",
+                payload="test prompt",
+                eval_parameters={"temperature": 0.0, "max_tokens": 100},
+            )
+
+    assert post.call_count == 1
+    assert ("anthropic", model_name) not in _MODELS_WITHOUT_SAMPLING_PARAMS
