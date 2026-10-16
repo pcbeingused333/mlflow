@@ -320,5 +320,14 @@ function extractTokenUsage(response: any): TokenUsage | undefined {
     result.cache_creation_input_tokens = usage.cache_creation_input_tokens;
   }
 
+  // Anthropic reports input_tokens excluding cache tokens. Normalize to include them,
+  // consistent with OpenAI/Gemini and the Python SDK's Anthropic integration.
+  const cacheTotal =
+    (result.cache_read_input_tokens ?? 0) + (result.cache_creation_input_tokens ?? 0);
+  if (cacheTotal > 0) {
+    result.input_tokens += cacheTotal;
+    result.total_tokens = result.input_tokens + result.output_tokens;
+  }
+
   return result;
 }
